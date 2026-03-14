@@ -1,8 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os, imageio_ffmpeg
+import sys
+from pathlib import Path
 
 # Path to the bundled ffmpeg.exe that imageio-ffmpeg ships
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+# Find pngquant.exe
+def _find_pngquant():
+    import shutil
+    found = shutil.which("pngquant")
+    if found:
+        return found
+    for candidate in [
+        Path(sys.executable).parent / "Scripts" / "pngquant.exe",
+        Path(sys.executable).parent / "pngquant.exe",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+PNGQUANT_EXE = _find_pngquant()
 
 block_cipher = None
 
@@ -12,7 +30,7 @@ a = Analysis(
     binaries=[
         # Bundle the ffmpeg executable so video compression works offline
         (FFMPEG_EXE, 'imageio_ffmpeg/binaries'),
-    ],
+    ] + ([(PNGQUANT_EXE, '.')] if PNGQUANT_EXE else []),
     datas=[
         # CustomTkinter assets (themes, fonts, images)
         (

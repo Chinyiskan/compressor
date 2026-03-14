@@ -5,11 +5,12 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 from PIL import Image
 import os
 import re
+import sys
 import json
+import shutil
 import threading
 import subprocess
 from pathlib import Path
-from datetime import datetime
 
 # ── Optional video support ─────────────────────────────────────────────────────
 try:
@@ -20,6 +21,33 @@ try:
 except Exception:
     FFMPEG_EXE = None
     FFMPEG_OK = False
+
+# ── pngquant binary (libimagequant — same engine as ilovepng) ───────────────────
+def _find_pngquant() -> str | None:
+    """Return path to pngquant executable, or None if not found."""
+    # 0. If running as compiled PyInstaller app
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        bundled = Path(sys._MEIPASS) / "pngquant.exe"
+        if bundled.exists():
+            return str(bundled)
+
+    # 1. On PATH
+    found = shutil.which("pngquant")
+    if found:
+        return found
+
+    # 2. pngquant-cli pip package places it next to the Python Scripts dir
+    for candidate in [
+        Path(sys.executable).parent / "Scripts" / "pngquant.exe",
+        Path(sys.executable).parent / "pngquant.exe",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+PNGQUANT_EXE = _find_pngquant()
+PNGQUANT_OK  = PNGQUANT_EXE is not None
 
 # ── Appearance ─────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -43,11 +71,6 @@ BORDER = "#30363D"
 
 # ── Presets ────────────────────────────────────────────────────────────────────
 IMG_FORMATS = ["Mantener original", "JPEG", "PNG", "WebP"]
-IMG_QUALITY = {
-    "Alta calidad  (85)": 85,
-    "Balanceado  (72)": 72,
-    "Máx. compresión  (55)": 55,
-}
 
 VID_FORMATS = ["Mantener original", "MP4  (H.264)", "WebM  (VP9)"]
 VID_QUALITY = {
@@ -55,6 +78,12 @@ VID_QUALITY = {
     "Balanceado  (CRF 26)": 26,
     "Máx. compresión  (CRF 32)": 32,
 }
+
+# ── Fixed auto-quality (no user selector — always best compression) ────────────
+# Same philosophy as ilovepng/iloveimg: squeeze as much as possible while
+# keeping the result visually indistinguishable from the original.
+IMG_QUALITY_AUTO = 78   # JPEG / WebP Pillow scale (0-95)
+VID_QUALITY_AUTO = 28   # FFmpeg CRF (lower = larger file)
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 VID_EXT = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -115,44 +144,145 @@ def get_video_duration(src: Path) -> float:
 
 
 # ── Image compression ──────────────────────────────────────────────────────────
-def compress_image(src: Path, dest_dir: Path, fmt: str, quality: int) -> dict:
-    img = Image.open(src)
+def _compress_png_pngquant(src: Path, out: Path, quality: int) -> bool:
+    """Run pngquant (libimagequant) on `src`, write to `out`.
+    Returns True on success. quality 0-100 maps to pngquant --quality range."""
+    if not PNGQUANT_OK:
+        return False
+    # Map our quality scale to pngquant --quality min-max
+    # quality=85 → 65-90  (high fidelity)
+    # quality=72 → 50-85  (balanced)
+    # quality=45 → 30-75  (aggressive — like iloveimg default)
+    if quality >= 80:
+        q_range = "65-90"
+    elif quality >= 65:
+        q_range = "50-85"
+    else:
+        q_range = "30-75"
 
+    cmd = [
+        PNGQUANT_EXE,
+        f"--quality={q_range}",
+        "--speed=1",        # slowest = best quality
+        "--strip",          # remove metadata
+        "--force",
+        "--output", str(out),
+        str(src),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        # pngquant exit codes: 0=ok, 98=quality too low (output still written), 99=skip
+        return r.returncode in (0, 98) and out.exists()
+    except Exception:
+        return False
+
+
+def _quantize_png_pillow(img: Image.Image, colors: int = 256) -> Image.Image:
+    """Pillow fallback quantizer (MEDIANCUT). Less efficient than libimagequant."""
+    has_alpha = img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+    if has_alpha:
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        q = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=1)
+        q = q.convert("RGBA")
+    else:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        q = img.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=1)
+        q = q.convert("RGB")
+    return q
+
+
+def compress_image(src: Path, dest_dir: Path, fmt: str, quality: int) -> dict:
+    """Compress an image maintaining the original format unless overridden.
+
+    PNG engine priority:
+      1. pngquant (libimagequant) — same as ilovepng, ~60-70% savings
+      2. Pillow MEDIANCUT fallback — ~30-40% savings
+
+    JPEG: progressive + chroma subsampling 4:2:0 at low quality
+    WebP: lossy method=6 (best encoder effort), strip metadata
+    """
+    img = Image.open(src)
+    img.load()
+
+    src_fmt = (img.format or src.suffix.lstrip(".")).upper()
+    if src_fmt in ("JPG",):
+        src_fmt = "JPEG"
+    if src_fmt in ("TIF",):
+        src_fmt = "TIFF"
+
+    # ── Decide output format ──────────────────────────────────────────────────
     if fmt == "Mantener original":
-        out_fmt = img.format or "JPEG"
+        out_fmt = src_fmt  # NEVER change format silently
     else:
         out_fmt = fmt
 
-    ext_map = {"JPEG": ".jpg", "PNG": ".png", "WebP": ".webp"}
-    out_ext = ext_map.get(out_fmt, src.suffix)
+    ext_map = {
+        "JPEG": ".jpg", "PNG": ".png",
+        "WEBP": ".webp", "WebP": ".webp",
+        "BMP": ".bmp",  "TIFF": ".tiff",
+    }
+    out_ext = ext_map.get(out_fmt, src.suffix.lower())
     out_path = dest_dir / (src.stem + out_ext)
 
-    if out_fmt == "JPEG" and img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
+    # ── PNG: pngquant first, Pillow fallback ─────────────────────────────────
+    if out_fmt == "PNG":
+        # Try pngquant (libimagequant) — the gold standard
+        pq_ok = _compress_png_pngquant(src, out_path, quality)
+        if not pq_ok:
+            # Fallback: Pillow MEDIANCUT + compress_level=9
+            n_colors = 256 if quality >= 72 else 64
+            try:
+                quantized = _quantize_png_pillow(img, colors=n_colors)
+                quantized.save(out_path, format="PNG", optimize=True, compress_level=9)
+            except Exception:
+                img.save(out_path, format="PNG", optimize=True, compress_level=9)
 
-    kw: dict = {}
-    if out_fmt in ("JPEG", "WebP"):
-        kw["quality"] = quality
-        kw["optimize"] = True
-    elif out_fmt == "PNG":
-        kw["optimize"] = True
-    if out_fmt == "WebP":
-        kw["method"] = 6
+    # ── WebP ──────────────────────────────────────────────────────────────
+    elif out_fmt in ("WebP", "WEBP"):
+        img.save(out_path, format="WebP", quality=quality, method=6, lossless=False)
 
-    img.save(out_path, format=out_fmt, **kw)
+    # ── JPEG ──────────────────────────────────────────────────────────────
+    elif out_fmt == "JPEG":
+        # Flatten alpha channel onto white background
+        if img.mode in ("RGBA", "P", "LA"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            if img.mode in ("RGBA", "LA"):
+                bg.paste(img, mask=img.split()[-1])
+            else:
+                bg.paste(img)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        subsampling = 0 if quality >= 80 else 2  # 4:4:4 vs 4:2:0
+        img.save(out_path, format="JPEG", quality=quality,
+                 optimize=True, progressive=True, subsampling=subsampling)
 
-    orig = src.stat().st_size
-    new = out_path.stat().st_size
+    # ── BMP / TIFF / other ──────────────────────────────────────────────
+    elif out_fmt in ("TIFF", "TIF"):
+        img.save(out_path, format="TIFF", compression="tiff_lzw")
+    elif out_fmt == "BMP":
+        img.save(out_path, format="BMP")
+    else:
+        img.save(out_path)
+
+    orig  = src.stat().st_size
+    new   = out_path.stat().st_size
     saved = orig - new
     return {
-        "name": src.name,
-        "orig": orig,
-        "new": new,
-        "saved": saved,
-        "pct": (saved / orig * 100) if orig else 0,
+        "name":     src.name,
+        "orig":     orig,
+        "new":      new,
+        "saved":    saved,
+        "pct":      (saved / orig * 100) if orig else 0,
         "out_path": out_path,
-        "out_fmt": out_fmt,
-        "ok": True,
+        "out_fmt":  out_fmt,
+        "ok":       True,
     }
 
 
@@ -169,13 +299,13 @@ def compress_video(
     if raw_fmt == "Mantener original":
         suf = src.suffix.lower()
         if suf == ".webm":
-            out_ext, vcodec, acodec = ".webm", "libvpx-vp9", "libopus"
+            out_ext, vcodec = ".webm", "libvpx-vp9"
         else:
-            out_ext, vcodec, acodec = ".mp4", "libx264", "aac"
+            out_ext, vcodec = ".mp4", "libx264"
     elif "WebM" in fmt:
-        out_ext, vcodec, acodec = ".webm", "libvpx-vp9", "libopus"
+        out_ext, vcodec = ".webm", "libvpx-vp9"
     else:
-        out_ext, vcodec, acodec = ".mp4", "libx264", "aac"
+        out_ext, vcodec = ".mp4", "libx264"
 
     out_path = dest_dir / (src.stem + "_c" + out_ext)
 
@@ -279,6 +409,7 @@ class CompressorApp(TkinterDnD.Tk):
         self.queued_files: list = []
         self.results: list = []
         self._processing = False
+        self._row_labels: dict = {}  # path → status Label widget
 
         self._build_ui()
         self._center_window()
@@ -362,69 +493,24 @@ class CompressorApp(TkinterDnD.Tk):
             relief="flat",
             cursor="hand2",
         )
-        self.drop_zone.pack(fill="x")
-        self.drop_zone.pack_propagate(False)
-        self.drop_zone.configure(height=172)
-
-        # Dashed inner frame to give a subtle inset look
-        dz_inner = tk.Frame(self.drop_zone, bg=BG_SURFACE)
-        dz_inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        self._dz_icon = tk.Label(
-            dz_inner, text="🖼️", bg=BG_SURFACE, font=("Segoe UI", 38)
-        )
-        self._dz_icon.pack()
-        self._dz_title = tk.Label(
-            dz_inner,
-            text="Arrastra tus imágenes aquí",
-            bg=BG_SURFACE,
-            fg=TEXT_PRI,
-            font=("Segoe UI", 14, "bold"),
-        )
-        self._dz_title.pack()
-        tk.Label(
-            dz_inner,
-            text="o haz clic para seleccionar archivos",
-            bg=BG_SURFACE,
-            fg=TEXT_SEC,
-            font=("Segoe UI", 10),
-        ).pack()
-        self._dz_hint = tk.Label(
-            dz_inner,
-            text="JPEG · PNG · WebP · BMP · TIFF",
-            bg=BG_SURFACE,
-            fg=TEXT_DIM,
-            font=("Segoe UI", 8),
-        )
-        self._dz_hint.pack(pady=(3, 0))
-
-        # DnD & click binding — bind to all children to avoid click-through gaps
+        self.drop_zone.pack(fill="x", ipady=28)
         self.drop_zone.drop_target_register(DND_FILES)
         self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
-        for w in [self.drop_zone, dz_inner] + list(dz_inner.winfo_children()):
-            w.bind("<Button-1>", lambda e: self._browse_files())
-        # Hover glow
-        accent_now = lambda: ACCENT if self._mode == "image" else ACCENT2
-        self.drop_zone.bind(
-            "<Enter>",
-            lambda e: (
-                self.drop_zone.configure(
-                    highlightbackground="#78BBFF"
-                    if self._mode == "image"
-                    else "#C084FC"
-                ),
-                dz_inner.configure(bg=BG_ELEVATED),
-            ),
-        )
-        self.drop_zone.bind(
-            "<Leave>",
-            lambda e: (
-                self.drop_zone.configure(
-                    highlightbackground=ACCENT if self._mode == "image" else ACCENT2
-                ),
-                dz_inner.configure(bg=BG_SURFACE),
-            ),
-        )
+
+        tk.Label(
+            self.drop_zone,
+            text="Arrastra y suelta archivos aquí",
+            bg=BG_SURFACE,
+            fg=TEXT_PRI,
+            font=("Segoe UI", 12, "bold"),
+        ).pack(pady=(10, 0))
+        tk.Label(
+            self.drop_zone,
+            text="o haz click para seleccionarlos",
+            bg=BG_SURFACE,
+            fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+        ).pack()
 
         # ══ Options row ════════════════════════════════════════════════════
         self.opts_frame = tk.Frame(self, bg=BG_BASE)
@@ -463,8 +549,8 @@ class CompressorApp(TkinterDnD.Tk):
         )
         self.fmt_menu.pack(anchor="w", pady=(6, 0))
 
-        # — Quality card —
-        qual_card = tk.Frame(
+        # — Auto-quality badge —
+        badge_card = tk.Frame(
             self.opts_frame,
             bg=BG_SURFACE,
             highlightbackground=BORDER,
@@ -472,29 +558,31 @@ class CompressorApp(TkinterDnD.Tk):
             padx=14,
             pady=11,
         )
-        qual_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        badge_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
         tk.Label(
-            qual_card,
+            badge_card,
             text="CALIDAD",
             bg=BG_SURFACE,
             fg=TEXT_DIM,
             font=("Segoe UI", 8, "bold"),
         ).pack(anchor="w")
 
-        self.qual_var = tk.StringVar(value=list(IMG_QUALITY.keys())[0])
-        self.qual_menu = ctk.CTkOptionMenu(
-            qual_card,
-            values=list(IMG_QUALITY.keys()),
-            variable=self.qual_var,
-            fg_color=BG_INPUT,
-            button_color=ACCENT,
-            button_hover_color=ACCENT_DARK,
-            dropdown_fg_color=BG_ELEVATED,
-            font=ctk.CTkFont("Segoe UI", 12),
-            width=240,
-        )
-        self.qual_menu.pack(anchor="w", pady=(6, 0))
+        tk.Label(
+            badge_card,
+            text="✨  Auto — Máxima compresión",
+            bg=BG_SURFACE,
+            fg=SUCCESS,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(8, 0))
+
+        tk.Label(
+            badge_card,
+            text="Igual que iloveimg · sin pérdida visible",
+            bg=BG_SURFACE,
+            fg=TEXT_DIM,
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(2, 0))
 
         # — Compress button —
         btn_card = tk.Frame(self.opts_frame, bg=BG_BASE)
@@ -628,14 +716,11 @@ class CompressorApp(TkinterDnD.Tk):
             self._dz_title.configure(text="Arrastra tus videos aquí")
             self._dz_hint.configure(text="MP4 · WebM · MOV · MKV · AVI")
 
-        # Format / quality options
+        # Format options
         fmts = IMG_FORMATS if is_img else VID_FORMATS
-        quals = list(IMG_QUALITY.keys()) if is_img else list(VID_QUALITY.keys())
 
         self.fmt_menu.configure(values=fmts, button_color=acc)
         self.fmt_var.set(fmts[0])
-        self.qual_menu.configure(values=quals, button_color=acc)
-        self.qual_var.set(quals[0])
 
         # Compress button color
         self.compress_btn.configure(fg_color=acc)
@@ -812,8 +897,8 @@ class CompressorApp(TkinterDnD.Tk):
         row.bind("<Enter>", _enter)
         row.bind("<Leave>", _leave)
 
-        # Store status label reference on the path object
-        path._row_status_label = status_lbl  # type: ignore
+        # Store status label reference in the app dict (Path objects are immutable)
+        self._row_labels[path] = status_lbl
 
     def _remove_from_queue(self, path: Path):
         if path in self.queued_files:
@@ -825,6 +910,7 @@ class CompressorApp(TkinterDnD.Tk):
         if self._processing:
             return
         self.queued_files.clear()
+        self._row_labels.clear()
         for w in self.inner_list.winfo_children():
             if w != self.empty_label:
                 w.destroy()
@@ -833,7 +919,6 @@ class CompressorApp(TkinterDnD.Tk):
         self.progress_bar.set(0)
 
     def _refresh_queue_label(self):
-        kind = "imagen(es)" if self._mode == "image" else "video(s)"
         self.queue_label.configure(text=f"Cola  ({len(self.queued_files)})")
 
     # ── Compression ───────────────────────────────────────────────────────────
@@ -865,10 +950,8 @@ class CompressorApp(TkinterDnD.Tk):
         total = len(self.queued_files)
         fmt = self.fmt_var.get()
 
-        if self._mode == "image":
-            quality = IMG_QUALITY[self.qual_var.get()]
-        else:
-            quality = VID_QUALITY[self.qual_var.get()]
+        # Fixed auto-quality: always use the optimal compression level
+        quality = IMG_QUALITY_AUTO if self._mode == "image" else VID_QUALITY_AUTO
 
         for i, src in enumerate(list(self.queued_files)):
             self.after(
@@ -898,7 +981,7 @@ class CompressorApp(TkinterDnD.Tk):
         self.after(0, self._show_summary)
 
     def _mark_row(self, path: Path, ok: bool):
-        lbl = getattr(path, "_row_status_label", None)
+        lbl = self._row_labels.get(path)
         if lbl and lbl.winfo_exists():
             lbl.configure(text="✅" if ok else "❌", fg=SUCCESS if ok else DANGER)
 
