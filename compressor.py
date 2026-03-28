@@ -72,7 +72,7 @@ BORDER = "#30363D"
 # ── Presets ────────────────────────────────────────────────────────────────────
 IMG_FORMATS = ["Mantener original", "JPEG", "PNG", "WebP"]
 
-VID_FORMATS = ["Mantener original", "MP4  (H.264)", "WebM  (VP9)"]
+VID_FORMATS = ["Mantener original", "MP4  (H.265 / HEVC)", "MP4  (H.264)", "WebM  (VP9)"]
 VID_QUALITY = {
     "Alta calidad  (CRF 20)": 20,
     "Balanceado  (CRF 26)": 26,
@@ -83,7 +83,7 @@ VID_QUALITY = {
 # Same philosophy as ilovepng/iloveimg: squeeze as much as possible while
 # keeping the result visually indistinguishable from the original.
 IMG_QUALITY_AUTO = 78   # JPEG / WebP Pillow scale (0-95)
-VID_QUALITY_AUTO = 28   # FFmpeg CRF (lower = larger file)
+VID_QUALITY_AUTO = 30   # FFmpeg CRF (lower = larger file)
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 VID_EXT = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -302,6 +302,8 @@ def compress_video(
             out_ext, vcodec = ".webm", "libvpx-vp9"
         else:
             out_ext, vcodec = ".mp4", "libx264"
+    elif "H.265" in fmt:
+        out_ext, vcodec = ".mp4", "libx265"
     elif "WebM" in fmt:
         out_ext, vcodec = ".webm", "libvpx-vp9"
     else:
@@ -311,50 +313,40 @@ def compress_video(
 
     duration = get_video_duration(src)
 
-    # Build ffmpeg command
-    if vcodec == "libx264":
+    # Bounding box scale formula (max ~720p/1280px) ensures massive savings for heavy HD files
+    vf_scale = "scale='trunc(iw*min(1,min(1280/iw,1280/ih))/2)*2':-2"
+    if vcodec == "libx265":
         cmd = [
-            FFMPEG_EXE,
-            "-y",
-            "-i",
-            str(src),
-            "-vcodec",
-            "libx264",
-            "-crf",
-            str(crf),
-            "-preset",
-            "medium",
-            "-acodec",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(out_path),
+            FFMPEG_EXE, "-y", "-i", str(src),
+            "-vcodec", "libx265",
+            "-crf", str(crf + 2),
+            "-preset", "slow",
+            "-vf", vf_scale,
+            "-acodec", "aac", "-b:a", "64k",
+            "-tag:v", "hvc1",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", str(out_path),
+        ]
+    elif vcodec == "libx264":
+        cmd = [
+            FFMPEG_EXE, "-y", "-i", str(src),
+            "-vcodec", "libx264",
+            "-crf", str(crf + 2),
+            "-preset", "slower",
+            "-vf", vf_scale,
+            "-acodec", "aac", "-b:a", "64k",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", str(out_path),
         ]
     else:  # VP9
         cmd = [
-            FFMPEG_EXE,
-            "-y",
-            "-i",
-            str(src),
-            "-vcodec",
-            "libvpx-vp9",
-            "-crf",
-            str(crf),
-            "-b:v",
-            "0",
-            "-acodec",
-            "libopus",
-            "-b:a",
-            "128k",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(out_path),
+            FFMPEG_EXE, "-y", "-i", str(src),
+            "-vcodec", "libvpx-vp9",
+            "-crf", str(crf + 5),
+            "-b:v", "0",
+            "-vf", vf_scale,
+            "-acodec", "libopus", "-b:a", "48k",
+            "-progress", "pipe:1", "-nostats", str(out_path),
         ]
 
     proc = subprocess.Popen(
@@ -493,24 +485,69 @@ class CompressorApp(TkinterDnD.Tk):
             relief="flat",
             cursor="hand2",
         )
-        self.drop_zone.pack(fill="x", ipady=28)
-        self.drop_zone.drop_target_register(DND_FILES)
-        self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
+        self.drop_zone.pack(fill="x")
+        self.drop_zone.pack_propagate(False)
+        self.drop_zone.configure(height=172)
 
-        tk.Label(
-            self.drop_zone,
-            text="Arrastra y suelta archivos aquí",
+        # Inner frame to give a subtle inset look
+        dz_inner = tk.Frame(self.drop_zone, bg=BG_SURFACE)
+        dz_inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._dz_icon = tk.Label(
+            dz_inner, text="🖼️", bg=BG_SURFACE, font=("Segoe UI", 38)
+        )
+        self._dz_icon.pack()
+        self._dz_title = tk.Label(
+            dz_inner,
+            text="Arrastra tus imágenes aquí",
             bg=BG_SURFACE,
             fg=TEXT_PRI,
-            font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(10, 0))
+            font=("Segoe UI", 14, "bold"),
+        )
+        self._dz_title.pack()
         tk.Label(
-            self.drop_zone,
-            text="o haz click para seleccionarlos",
+            dz_inner,
+            text="o haz clic para seleccionar archivos",
+            bg=BG_SURFACE,
+            fg=TEXT_SEC,
+            font=("Segoe UI", 10),
+        ).pack()
+        self._dz_hint = tk.Label(
+            dz_inner,
+            text="JPEG · PNG · WebP · BMP · TIFF",
             bg=BG_SURFACE,
             fg=TEXT_DIM,
-            font=("Segoe UI", 9),
-        ).pack()
+            font=("Segoe UI", 8),
+        )
+        self._dz_hint.pack(pady=(3, 0))
+
+        # DnD & click binding
+        self.drop_zone.drop_target_register(DND_FILES)
+        self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
+        for w in [self.drop_zone, dz_inner] + list(dz_inner.winfo_children()):
+            w.bind("<Button-1>", lambda e: self._browse_files())
+
+        # Hover glow
+        self.drop_zone.bind(
+            "<Enter>",
+            lambda e: (
+                self.drop_zone.configure(
+                    highlightbackground="#78BBFF"
+                    if self._mode == "image"
+                    else "#C084FC"
+                ),
+                dz_inner.configure(bg=BG_ELEVATED),
+            ),
+        )
+        self.drop_zone.bind(
+            "<Leave>",
+            lambda e: (
+                self.drop_zone.configure(
+                    highlightbackground=ACCENT if self._mode == "image" else ACCENT2
+                ),
+                dz_inner.configure(bg=BG_SURFACE),
+            ),
+        )
 
         # ══ Options row ════════════════════════════════════════════════════
         self.opts_frame = tk.Frame(self, bg=BG_BASE)
@@ -548,41 +585,6 @@ class CompressorApp(TkinterDnD.Tk):
             width=210,
         )
         self.fmt_menu.pack(anchor="w", pady=(6, 0))
-
-        # — Auto-quality badge —
-        badge_card = tk.Frame(
-            self.opts_frame,
-            bg=BG_SURFACE,
-            highlightbackground=BORDER,
-            highlightthickness=1,
-            padx=14,
-            pady=11,
-        )
-        badge_card.pack(side="left", fill="both", expand=True, padx=(0, 8))
-
-        tk.Label(
-            badge_card,
-            text="CALIDAD",
-            bg=BG_SURFACE,
-            fg=TEXT_DIM,
-            font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w")
-
-        tk.Label(
-            badge_card,
-            text="✨  Auto — Máxima compresión",
-            bg=BG_SURFACE,
-            fg=SUCCESS,
-            font=("Segoe UI", 11, "bold"),
-        ).pack(anchor="w", pady=(8, 0))
-
-        tk.Label(
-            badge_card,
-            text="Igual que iloveimg · sin pérdida visible",
-            bg=BG_SURFACE,
-            fg=TEXT_DIM,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w", pady=(2, 0))
 
         # — Compress button —
         btn_card = tk.Frame(self.opts_frame, bg=BG_BASE)
