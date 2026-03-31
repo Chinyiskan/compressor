@@ -22,6 +22,9 @@ def _find_pngquant():
 
 PNGQUANT_EXE = _find_pngquant()
 
+# Dynamically resolve site-packages for the current Python install
+SITE_PACKAGES = Path(sys.executable).parent / "Lib" / "site-packages"
+
 block_cipher = None
 
 a = Analysis(
@@ -33,20 +36,12 @@ a = Analysis(
     ] + ([(PNGQUANT_EXE, '.')] if PNGQUANT_EXE else []),
     datas=[
         # CustomTkinter assets (themes, fonts, images)
-        (
-            'C:\\Users\\david\\AppData\\Local\\Programs\\Python\\Python310\\lib\\site-packages\\customtkinter',
-            'customtkinter'
-        ),
+        (str(SITE_PACKAGES / 'customtkinter'), 'customtkinter'),
         # tkinterdnd2 native libraries
-        (
-            'C:\\Users\\david\\AppData\\Local\\Programs\\Python\\Python310\\lib\\site-packages\\tkinterdnd2',
-            'tkinterdnd2'
-        ),
+        (str(SITE_PACKAGES / 'tkinterdnd2'), 'tkinterdnd2'),
         # imageio-ffmpeg metadata (needed so the package finds its binary)
-        (
-            'C:\\Users\\david\\AppData\\Local\\Programs\\Python\\Python310\\lib\\site-packages\\imageio_ffmpeg',
-            'imageio_ffmpeg'
-        ),
+        (str(SITE_PACKAGES / 'imageio_ffmpeg'), 'imageio_ffmpeg'),
+        ('favicon.ico', '.'),
     ],
     hiddenimports=[
         'customtkinter',
@@ -55,7 +50,6 @@ a = Analysis(
         'PIL.Image',
         'PIL.ImageTk',
         'imageio_ffmpeg',
-        'ffmpeg',
     ],
     hookspath=[],
     hooksconfig={},
@@ -88,5 +82,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='icon.ico',      # descomenta si tienes un .ico
+    icon='favicon.ico',
 )

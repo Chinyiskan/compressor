@@ -98,6 +98,12 @@ def human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def resource_path(relative_path: str) -> Path:
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).parent / relative_path
+
 def get_downloads_folder() -> Path:
     return Path.home() / "Downloads" / "Compresso"
 
@@ -396,6 +402,13 @@ class CompressorApp(TkinterDnD.Tk):
         self.geometry("960x720")
         self.minsize(820, 640)
         self.configure(bg=BG_BASE)
+
+        try:
+            icon_path = resource_path("favicon.ico")
+            if icon_path.exists():
+                self.iconbitmap(str(icon_path))
+        except Exception:
+            pass
 
         self._mode = "image"  # "image" | "video"
         self.queued_files: list = []
