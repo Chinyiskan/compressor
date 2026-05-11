@@ -28,7 +28,7 @@ SITE_PACKAGES = Path(sys.executable).parent / "Lib" / "site-packages"
 block_cipher = None
 
 a = Analysis(
-    ['compressor.py'],
+    ['main.py'],
     pathex=[],
     binaries=[
         # Bundle the ffmpeg executable so video compression works offline
@@ -50,6 +50,8 @@ a = Analysis(
         'PIL.Image',
         'PIL.ImageTk',
         'imageio_ffmpeg',
+        'fitz',
+        'pymupdf',
     ],
     hookspath=[],
     hooksconfig={},
